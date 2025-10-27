@@ -1,0 +1,126 @@
+# .github/workflows/check-compliance-release.yml
+
+name: Check Compliance as Code and build STIG role
+
+on:
+  schedule:
+    - cron: '0 0 * * 0'
+  workflow_dispatch: {}
+
+env:
+  # Repo to Watch ---
+  TARGET_REPO: "ComplianceAsCode/content" 
+  STATE_FILE: ".github/state/last_seen_release"
+  
+  # Define the repo to push to (e.g., "your-username/my-rhel9-stig-repo")
+  TARGET_ROLE_REPO: "deperr/test-stig-build-02"
+  
+  # Specify the role directory to copy the build output
+  # (e.g., "rhel9_stig", "rhel8_stig", etc. Look inside the 'out' dir to find the name)
+  SOURCE_ROLE_DIR: "rhel9_stig"
+  
+  # 3. The path inside your target repo to check out to (do not change this)
+  TARGET_CHECKOUT_PATH: "target-repo"
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      
+    steps:
+      - name: Check out workflow repo (test-repo-2)
+        uses: actions/checkout@v4
+        # This checks out the repo this workflow is in
+
+      - name: 📡 Get latest release tag from ComplianceAsCode
+        id: get_release
+        run: |
+          TAG=$(curl -s -H "Accept: application/vnd.github.v3+json" \
+          "https://api.github.com/repos/${{ env.TARGET_REPO }}/releases/latest" | jq -r .tag_name)
+          echo "Latest release on ${{ env.TARGET_REPO }} is: $TAG"
+          echo "latest_tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Get last processed tag from file
+        id: get_last_tag
+        run: |
+          if [ -f "${{ env.STATE_FILE }}" ]; then
+            echo "last_tag=$(cat ${{ env.STATE_FILE }})" >> $GITHUB_OUTPUT
+          else
+            echo "last_tag=''" >> $GITHUB_OUTPUT
+          fi
+        
+      - name: Compare, Build, and Generate Role
+        id: compare
+        if: steps.get_release.outputs.latest_tag != steps.get_last_tag.outputs.last_tag
+        run: |
+          echo "✅ New release found: ${{ steps.get_release.outputs.latest_tag }}"
+          
+          echo "Installing Dependencies"
+          sudo apt-get update
+          sudo apt-get install -y git cmake make openscap-common openscap-scanner python3-yaml \
+          python3-setuptools python3-pip python3-github libxml2-utils xsltproc
+          
+          echo "Cloning ComplianceAsCode/content"
+          git clone https://github.com/ComplianceAsCode/content
+          cd content
+          
+          echo "Checking out new release tag"
+          git checkout ${{ steps.get_release.outputs.latest_tag }}
+          
+          echo "Building the product for RHEL 9"
+          ./build_product rhel9
+          
+          echo "Generating the Ansible role"
+          export PYTHONPATH=.
+          utils/ansible_playbook_to_role.py --dry-run out --build-playbooks-dir build/ansible
+          
+          # Move back to the root
+          cd .. 
+          
+          echo "Updating state file"
+          mkdir -p $(dirname "${{ env.STATE_FILE }}")
+          echo "${{ steps.get_release.outputs.latest_tag }}" > ${{ env.STATE_FILE }}
+          echo "new_release_found=true" >> $GITHUB_OUTPUT
+
+      # Below are steps to push the content to a new repository
+      # The target will eventually be RedHatOfficial/ansible-role-rhel9-stig)
+
+      - name: Check out target repo (${{ env.TARGET_ROLE_REPO }})
+        # This step only runs if a new release was found
+        if: steps.compare.outputs.new_release_found == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TARGET_ROLE_REPO }}
+          token: ${{ secrets.TARGET_REPO_PAT }} # The PAT you created
+          path: ${{ env.TARGET_CHECKOUT_PATH }} # Checks it out into a sub-directory
+
+      - name: Copy the STIG role to target repo
+        if: steps.compare.outputs.new_release_found == 'true'
+        run: |
+          echo "Copying 'content/out/${{ env.SOURCE_ROLE_DIR }}' to '${{ env.TARGET_CHECKOUT_PATH }}/'"
+          
+          # This command clears the target dir (except .git) and copies the new role in
+          # This ensures old files are removed.
+          cd ${{ env.TARGET_CHECKOUT_PATH }}
+          git rm -rf .
+          cd ..
+          cp -r content/out/${{ env.SOURCE_ROLE_DIR }}/* ${{ env.TARGET_CHECKOUT_PATH }}/
+          
+      - name: Commit generated role to TARGET repo
+        if: steps.compare.outputs.new_release_found == 'true'
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Update STIG Ansible role to ${{ steps.get_release.outputs.latest_tag }}"
+          # This is the key: it tells the action to work inside the target repo's checkout
+          repository: ${{ env.TARGET_CHECKOUT_PATH }}
+          tagging_message: "auto-stig-${{ steps.get_release.outputs.latest_tag }}"
+          
+      - name: 💾 Commit state file to THIS repo
+        # This step *also* runs, but commits to the main repo
+        if: steps.compare.outputs.new_release_found == 'true'
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Update last seen ComplianceAsCode release to ${{ steps.get_release.outputs.latest_tag }}"
+          # This targets only the state file in the main repo checkout
+          file_pattern: ${{ env.STATE_FILE }}
